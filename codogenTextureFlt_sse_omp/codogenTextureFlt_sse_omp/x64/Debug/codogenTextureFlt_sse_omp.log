@@ -1,0 +1,4 @@
+﻿  codogenTextureFlt_sse_omp.cpp
+C:\Users\Anastasya\source\repos\codogenTextureFlt_sse_omp\codogenTextureFlt_sse_omp\codogenTextureFlt_sse_omp.cpp(411,84): warning C4474: "fprintf" : для строки формата передано слишком много аргументов
+C:\Users\Anastasya\source\repos\codogenTextureFlt_sse_omp\codogenTextureFlt_sse_omp\codogenTextureFlt_sse_omp.cpp(411,84): message : заполнители и их параметры ожидают переменное число аргументов в количестве 0, но было предоставлено 1
+  codogenTextureFlt_sse_omp.vcxproj -> C:\Users\Anastasya\source\repos\codogenTextureFlt_sse_omp\x64\Debug\codogenTextureFlt_sse_omp.exe

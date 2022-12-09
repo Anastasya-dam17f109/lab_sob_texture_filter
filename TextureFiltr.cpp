@@ -5,6 +5,11 @@
 #include <conio.h>
 #include <string>
 #include <omp.h>
+#include <pmmintrin.h>
+#include <smmintrin.h>
+#include <immintrin.h>
+#include <emmintrin.h>
+#include <xmmintrin.h>
 #include <fstream>
 #include "MU16Data.h"
 #include "TextureFiltr_Mean_V8_CodeGen.h"
@@ -1518,6 +1523,242 @@ void TextureFiltr_Mean_omp2_7_3(MU16Data& ar_cmmIn, MFData& ar_cmmOut,  double p
 		delete[] pbBrightness;
 }
 
+//
+
+void TextureFiltr_Mean_V8_3_sse(MU16Data& ar_cmmIn, MFData& ar_cmmOut, double pseudo_min, double kfct)
+{
+	double Size_obratn = 1.0 / 9;
+	// Кэш для гистограмм
+	uint16_t* pHistAll = new uint16_t[256 * ar_cmmIn.m_i64W]; // [256][ar_cmmIn.m_i64W]
+	memset(pHistAll, 0, sizeof(uint16_t) * 256 * ar_cmmIn.m_i64W);
+	uint16_t* pHist, * pHistAdd, * pHistSub;
+	// Кэш для сумм
+	uint32_t* puiSum = new uint32_t[ar_cmmIn.m_i64W], * puiSumCurr;
+	memset(puiSum, 0, sizeof(uint32_t) * ar_cmmIn.m_i64W);
+	// Кэш для яркостей
+	uint8_t* pbBrightness = new uint8_t[ar_cmmIn.m_i64W * 3];
+	uint8_t* pbBrightnessRow;
+	int64_t iRow, iCol, iColMax = ar_cmmIn.m_i64W - 3;
+	ar_cmmOut.iCreate(ar_cmmIn.m_i64W, ar_cmmIn.m_i64H, 6);
+	// Обнуляем края. Первые строки.
+	for (iRow = 0; iRow < 1; iRow++)
+		memset(ar_cmmOut.pfGetRow(iRow), 0, sizeof(float) * ar_cmmOut.m_i64LineSizeEl);
+	int64_t i, iCmin, iCmax, iPos = 0;
+	uint32_t u32ValueAdd, u32ValueSub;
+	double d;
+	// Первые [0, 3 - 1] строки
+	pbBrightnessRow = pbBrightness;
+	float* pfRowOut = ar_cmmOut.pfGetRow(1) + 1;
+	for (iRow = 0; iRow < 3; iRow++, pbBrightnessRow += ar_cmmIn.m_i64W)
+	{
+		// Обнуляем края строк.
+		memset(ar_cmmOut.pfGetRow(iRow), 0, sizeof(float) * 1);
+		memset(ar_cmmOut.pfGetRow(iRow) + (ar_cmmIn.m_i64W - 1), 0, sizeof(float) * 1);
+		uint16_t* pRowIn = ar_cmmIn.pu16GetRow(iRow);
+		// Первые [0, 2*1[ колонки
+		for (iCol = 0; iCol < (1 << 1); iCol++)
+		{
+			iCmin = max(1, static_cast<int>(iCol - 1));
+			iCmax = iCol + 1;
+			if ((d = (pRowIn[iCol] - pseudo_min) * kfct) < 0.5) // Так как при яркости 0 вклад в сумму будет 0 при любом pHist[0], то pHist[0] можно просто нигде не учитывать, но яркость в кэше нужно обнулить!
+				pbBrightnessRow[iCol] = 0;
+			else
+			{
+				if ((u32ValueAdd = static_cast<uint32_t>(d + 0.5)) > 255)
+				{
+					pbBrightnessRow[iCol] = u32ValueAdd = 255;
+					pHistAdd = pHistAll + (255 * ar_cmmIn.m_i64W);
+				}
+				else
+				{
+					pbBrightnessRow[iCol] = static_cast<uint8_t>(u32ValueAdd);
+					pHistAdd = pHistAll + (u32ValueAdd * ar_cmmIn.m_i64W);
+				}
+				// Добавляем яркость в 3 гистограмм и сумм
+				for (i = iCmin; i <= iCmax; i++)
+					puiSum[i] += u32ValueAdd * (1 + (static_cast<uint32_t>(pHistAdd[i]++) << 1));
+			}
+		}
+		// Средние [2*1, ar_cmmIn.m_i64W - 3] колонки
+		puiSumCurr = puiSum + 1;
+		for (; iCol <= iColMax; iCol++, puiSumCurr++)
+		{
+			iCmin = iCol - 1;
+			if ((d = (pRowIn[iCol] - pseudo_min) * kfct) < 0.5) // Так как при яркости 0 вклад в сумму будет 0 	при любом pHist[0], то pHist[0] можно просто нигде не учитывать, но яркость в кэше нужно обнулить!
+				pbBrightnessRow[iCol] = 0;
+			else
+			{
+				if ((u32ValueAdd = static_cast<uint32_t>(d + 0.5)) > 255)
+				{
+					pbBrightnessRow[iCol] = u32ValueAdd = 255;
+					pHistAdd = pHistAll + (255 * ar_cmmIn.m_i64W + iCmin);
+				}
+				else
+				{
+					pbBrightnessRow[iCol] = static_cast<uint8_t>(u32ValueAdd);
+					pHistAdd = pHistAll + (u32ValueAdd * ar_cmmIn.m_i64W + iCmin);
+				}
+				// Добавляем яркость в 3 гистограмм и сумм
+				for (i = 0; i < 3; i++)
+					puiSumCurr[i] += u32ValueAdd * (1 + (static_cast<uint32_t>(pHistAdd[i]++) << 1));
+			}
+			if ((3 - 1) == iRow)
+			{
+				pfRowOut[0] = static_cast<float>(puiSumCurr[0] * Size_obratn);
+				pfRowOut++;
+			}
+		}
+		// Последние [ar_cmmIn.m_i64W - 2*1, ar_cmmIn.m_i64W - 1] колонки
+		for (; iCol < ar_cmmIn.m_i64W; iCol++)
+		{
+			iCmin = iCol - 1;
+			iCmax = min(ar_cmmIn.m_i64W - 1 - 1, iCol + 1);
+			if ((d = (pRowIn[iCol] - pseudo_min) * kfct) < 0.5) // Так как при яркости 0 вклад в сумму будет 0 при любом pHist[0], то pHist[0] можно просто нигде не учитывать, но яркость в кэше нужно обнулить!
+				pbBrightnessRow[iCol] = 0;
+			else
+			{
+				if ((u32ValueAdd = static_cast<uint32_t>(d + 0.5)) > 255)
+				{
+					pbBrightnessRow[iCol] = u32ValueAdd = 255;
+					pHistAdd = pHistAll + (255 * ar_cmmIn.m_i64W);
+				}
+				else
+				{
+					pbBrightnessRow[iCol] = static_cast<uint8_t>(u32ValueAdd);
+					pHistAdd = pHistAll + (u32ValueAdd * ar_cmmIn.m_i64W);
+				}
+				// Добавляем яркость в 3 гистограмм и сумм
+				for (i = iCmin; i <= iCmax; i++)
+					puiSum[i] += u32ValueAdd * (1 + (static_cast<uint32_t>(pHistAdd[i]++) << 1));
+			}
+			if ((3 - 1) == iRow)
+			{
+				pfRowOut[0] = static_cast<float>(puiSum[iCmin] * Size_obratn);
+				pfRowOut++;
+			}
+		}
+	}
+	__m128i xmmHistOne_3 = _mm_set_epi16(0, 0, 0, 0, 0, 1, 1, 1); // Для inc или dec сразу для 3 гистограмм
+	// Последующие строки [3, ar_cmmIn.m_i64H[
+	for (iRow = 3; iRow < ar_cmmIn.m_i64H; iRow++)
+	{
+		// Обнуляем края строк.
+		memset(ar_cmmOut.pfGetRow(iRow), 0, sizeof(float) * 1);
+		memset(ar_cmmOut.pfGetRow(iRow) + (ar_cmmIn.m_i64W - 1), 0, sizeof(float) * 1);
+		uint16_t* pRowIn = ar_cmmIn.pu16GetRow(iRow);
+		float* pfRowOut = ar_cmmOut.pfGetRow(iRow - 1) + 1;
+		iPos = (iRow - 3) % 3;
+		pbBrightnessRow = pbBrightness + (iPos * ar_cmmIn.m_i64W);
+		// Первые [0, 2*1[ колонки
+		for (iCol = 0; iCol < (1 << 1); iCol++)
+		{
+			iCmin = max(1, static_cast<int>(iCol - 1));
+			iCmax = iCol + 1;
+			if ((d = (pRowIn[iCol] - pseudo_min) * kfct) < 0.5) // Так как при яркости 0 вклад в сумму будет 0 при любом pHist[0], то pHist[0] можно просто нигде не учитывать, но яркость в кэше нужно обнулить!
+				u32ValueAdd = 0;
+			else
+			{
+				if ((u32ValueAdd = static_cast<uint32_t>(d + 0.5)) > 255)
+					u32ValueAdd = 255;
+			}
+			if (u32ValueAdd != (u32ValueSub = pbBrightnessRow[iCol]))
+			{
+				pHistSub = pHistAll + (u32ValueSub * ar_cmmIn.m_i64W);
+				pHistAdd = pHistAll + (u32ValueAdd * ar_cmmIn.m_i64W);
+				pbBrightnessRow[iCol] = u32ValueAdd;
+				uint32_t u32ValueAddSub = u32ValueAdd + u32ValueSub;
+				// Добавляем яркость в 3 гистограмм и сумм
+				for (i = iCmin; i <= iCmax; i++)
+					puiSum[i] += u32ValueAddSub + ((u32ValueAdd * static_cast<uint32_t>(pHistAdd[i]++) -
+						u32ValueSub * static_cast<uint32_t>(pHistSub[i]--)) << 1);
+			}
+		}
+		// Средние [2*1, ar_cmmIn.m_i64W - 3] колонки
+		puiSumCurr = puiSum + 1;
+		pHist = pHistAll + (iCol - 1);
+		for (; iCol <= iColMax; iCol++, puiSumCurr++, pHist++)
+		{
+			if ((d = (pRowIn[iCol] - pseudo_min) * kfct) < 0.5) // Так как при яркости 0 вклад в сумму будет 0 при любом pHist[0], то pHist[0] можно просто нигде не учитывать, но яркость в кэше нужно обнулить!
+				u32ValueAdd = 0;
+			else
+			{
+				if ((u32ValueAdd = static_cast<uint32_t>(d + 0.5)) > 255)
+					u32ValueAdd = 255;
+			}
+			if (u32ValueAdd != (u32ValueSub = pbBrightnessRow[iCol]))
+			{
+				pHistSub = pHist + (u32ValueSub * ar_cmmIn.m_i64W);
+				pHistAdd = pHist + (u32ValueAdd * ar_cmmIn.m_i64W);
+				pbBrightnessRow[iCol] = u32ValueAdd;
+				// Добавляем яркость в 3 гистограмм и сумм
+				//============================
+				// Первые 3 точки
+				//============================
+				__m128i xmmHistSub = _mm_lddqu_si128(reinterpret_cast<__m128i*>(pHistSub)); // Загружаем 128 бит(используем 48 бит - 3 эл.массива)
+					__m128i xmmHistAdd = _mm_lddqu_si128(reinterpret_cast<__m128i*>(pHistAdd));
+				// 3 элемента гистограммы
+				__m128i xmmSumCurr = _mm_lddqu_si128(reinterpret_cast<__m128i*>(puiSumCurr)); // Загружаем 128 бит(используем 96 бит - 3 эл.массива)
+					__m128i xmmHistSub32 = _mm_cvtepu16_epi32(xmmHistSub); // HistSub32[3], HistSub32[2], HistSub32[1], HistSub32[0](Hi < ->Lo)
+					__m128i xmmHistAdd32 = _mm_cvtepu16_epi32(xmmHistAdd);
+				__m128i xmmValueAdd = _mm_loadu_si32(&u32ValueAdd); // 0, 0, 0, u32ValueAdd (Hi < ->Lo)
+				__m128i xmmValueSub = _mm_loadu_si32(&u32ValueSub);
+				xmmValueAdd = _mm_castps_si128(_mm_shuffle_ps(_mm_castsi128_ps(xmmValueAdd),
+					_mm_castsi128_ps(xmmValueAdd), 0x0C0)); // 0, u32ValueAdd, u32ValueAdd, u32ValueAdd
+				xmmValueSub = _mm_castps_si128(_mm_shuffle_ps(_mm_castsi128_ps(xmmValueSub),
+					_mm_castsi128_ps(xmmValueSub), 0x0C0));
+				xmmHistAdd32 = _mm_sub_epi32(_mm_mullo_epi32(xmmHistAdd32, xmmValueAdd),
+					_mm_mullo_epi32(xmmHistSub32, xmmValueSub));
+				xmmHistAdd32 = _mm_add_epi32(xmmHistAdd32, xmmHistAdd32); // <<= 1
+				xmmHistAdd32 = _mm_add_epi32(xmmHistAdd32, xmmValueAdd);
+				xmmHistAdd32 = _mm_add_epi32(xmmHistAdd32, xmmValueSub);
+				_mm_storeu_si128(reinterpret_cast<__m128i*>(puiSumCurr), _mm_add_epi32(xmmSumCurr,
+					xmmHistAdd32)); // Сохраняем puiSumCurr[0,1,2,3]
+				_mm_storeu_si128(reinterpret_cast<__m128i*>(pHistAdd), _mm_add_epi16(xmmHistAdd,
+					xmmHistOne_3)); // pHistAdd[0-2]++; Сохраняем 128 бит (используем 128 - 8 эл. массива)
+				_mm_storeu_si128(reinterpret_cast<__m128i*>(pHistSub), _mm_sub_epi16(xmmHistSub,
+					xmmHistOne_3)); // pHistSub[0-2]--; Сохраняем 128 бит (используем 128 - 8 эл. массива)
+			}
+			pfRowOut[0] = static_cast<float>(puiSumCurr[0] * Size_obratn);
+			pfRowOut++;
+		}
+		// Последние [ar_cmmIn.m_i64W - 2*1, ar_cmmIn.m_i64W - 1] колонки
+		for (; iCol < ar_cmmIn.m_i64W; iCol++)
+		{
+			iCmin = iCol - 1;
+			iCmax = min(ar_cmmIn.m_i64W - 1 - 1, iCol + 1);
+			if ((d = (pRowIn[iCol] - pseudo_min) * kfct) < 0.5) // Так как при яркости 0 вклад в сумму будет 0 при любом pHist[0], то pHist[0] можно просто нигде не учитывать, но яркость в кэше нужно обнулить!
+				u32ValueAdd = 0;
+			else
+			{
+				if ((u32ValueAdd = static_cast<uint32_t>(d + 0.5)) > 255)
+					u32ValueAdd = 255;
+			}
+			if (u32ValueAdd != (u32ValueSub = pbBrightnessRow[iCol]))
+			{
+				pHistSub = pHistAll + (u32ValueSub * ar_cmmIn.m_i64W);
+				pHistAdd = pHistAll + (u32ValueAdd * ar_cmmIn.m_i64W);
+				pbBrightnessRow[iCol] = u32ValueAdd;
+				uint32_t u32ValueAddSub = u32ValueAdd + u32ValueSub;
+				// Добавляем яркость в 3 гистограмм и сумм
+				for (i = iCmin; i <= iCmax; i++)
+					puiSum[i] += u32ValueAddSub + ((u32ValueAdd * static_cast<uint32_t>(pHistAdd[i]++) -
+						u32ValueSub * static_cast<uint32_t>(pHistSub[i]--)) << 1);
+			}
+			pfRowOut[0] = static_cast<float>(puiSum[iCmin] * Size_obratn);
+			pfRowOut++;
+		}
+	}
+	// Обнуляем края. Последние строки.
+	for (iRow = ar_cmmIn.m_i64H - 1; iRow < ar_cmmOut.m_i64H; iRow++)
+		memset(ar_cmmOut.pfGetRow(iRow), 0, sizeof(float) * ar_cmmOut.m_i64LineSizeEl);
+	if (nullptr != pHistAll)
+		delete[] pHistAll;
+	if (nullptr != puiSum)
+		delete[] puiSum;
+	if (nullptr != pbBrightness)
+		delete[] pbBrightness;
+}
+
 //================================================================
 //================================================================
 
@@ -1562,24 +1803,27 @@ int main()
 	также при записи времени нужно заменить в строковом представлении числа . на ,
 	Иначе exel может принять это за дату
 	*/
-	ofstream outTime("calcTime_many_threads_2_8_Codogen_version.csv");
+	ofstream outTime("calcTime_many_threads_overall.csv", ios_base::out|ios_base::app);
 	
-	outTime << "thrAmount" << ";";
+	/*outTime << "func_name; thrAmount" << ";";
 	for (Win_cen = 1; Win_cen < 11; ++Win_cen)
 	{
 		Win_size = 1 + 2 * Win_cen;
 		outTime << std::to_string(Win_size) + "x" + std::to_string(Win_size) << ";";
 	}
-	outTime << endl;
+	outTime << endl;*/
 	for (int thrAmount = 2; thrAmount < 4; thrAmount <<= 1)
 	{
+		outTime << "2_8_Codogen_version;";
 		outTime << thrAmount << ";";
-		for (Win_cen = 1; Win_cen < 10; ++Win_cen)
+		for (Win_cen = 1; Win_cen < 11; ++Win_cen)
 		{
 			Win_size = 1 + 2 * Win_cen;
 			cout << "calc win_size = " << Win_size << endl;
 			dStart = omp_get_wtime();
-			g_afunTextureFiltr_Mean_V8[Win_cen-1](m, mOut, pseudo_min, kfct);
+			g_afunTextureFiltr_Mean_V8_sse4_omp[Win_cen-1](m, mOut, pseudo_min, kfct, thrAmount);
+			//g_afunTextureFiltr_Mean_V8_sse4[Win_cen - 1](m, mOut, pseudo_min, kfct);
+			//TextureFiltr_Mean_V8_3_sse(m, mOut, pseudo_min, kfct);
 			//TextureFiltr_Mean_omp2_7_3(m, mOut,  pseudo_min, kfct);
 			dEnd = omp_get_wtime();
 			//outTime << pcFilePath + std::string("Out") + std::to_string(Win_size) + "x" + std::to_string(Win_size) <<
@@ -1587,7 +1831,7 @@ int main()
 			string time_dif = std::to_string(dEnd - dStart);
 			cout << time_dif << endl;
 			auto pos = time_dif.find(".");
-			outTime << time_dif.replace(pos, pos + strPoint.length(), ",") << ";";
+			outTime << time_dif.replace(pos, pos + strPoint.length()-1, ",") << ";";
 			strFileOut = pcFilePath + std::string("Out") + std::to_string(Win_size) + "x" + std::to_string(Win_size) + "_new_src.mfd";
 			mOut.iWrite(strFileOut.c_str());
 			/*блок, в котором идет сравнение с эталоном
@@ -1611,7 +1855,10 @@ int main()
 					for (int64_t iCol = 0; iCol < m.m_i64W; iCol++)
 					{
 						if (fabs(mOut.m_pData[iRow * mOut.m_i64W + iCol] - etalon.m_pData[iRow * mOut.m_i64W + iCol]) > eps)
+						{
 							notEquivalCount++;
+							cout << "idx: " << iRow << " " << iCol << " " << fabs(mOut.m_pData[iRow * mOut.m_i64W + iCol] - etalon.m_pData[iRow * mOut.m_i64W + iCol]) << endl;
+						}
 					}
 				}
 				if (notEquivalCount > 0)
